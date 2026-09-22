@@ -1,0 +1,1 @@
+"""Contract batch processor application."""

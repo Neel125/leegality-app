@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Contract batch review</title>
+  <style>
+    :root {
+      --ink: #1c1915;
+      --muted: #5c564e;
+      --line: #e4ddd2;
+      --paper: #f7f4ef;
+      --card: #fffdf9;
+      --accent: #8c3a2f;
+      --accent-ink: #fff;
+      --ok: #1f6b45;
+      --bad: #8c3a2f;
+      --warn: #8a5a12;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 16px/1.45 "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    header, main { max-width: 960px; margin: 0 auto; padding: 24px 20px; }
+    header { padding-bottom: 0; }
+    h1 { font-size: 1.8rem; font-weight: 600; margin: 0 0 6px; }
+    h2 { font-size: 1.15rem; margin: 0 0 12px; }
+    p.lede { margin: 0; color: var(--muted); }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 18px;
+      margin-top: 16px;
+    }
+    label { display: block; font-size: 0.85rem; letter-spacing: 0.02em; margin-bottom: 6px; }
+    input[type="text"], input[type="file"] {
+      width: 100%;
+      font: inherit;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .row { display: grid; gap: 12px; }
+    @media (min-width: 720px) {
+      .row.two { grid-template-columns: 1.2fr 1fr; }
+    }
+    button, .btn {
+      font: inherit;
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 14px;
+      cursor: pointer;
+      background: var(--accent);
+      color: var(--accent-ink);
+    }
+    button.ghost, .btn.ghost {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .stats { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 0.95rem; }
+    .stats strong { color: var(--ink); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; font-size: 0.8rem; letter-spacing: 0.03em; }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      background: #efe8dc;
+    }
+    .pill.completed, .pill.accepted { background: #e5f3eb; color: var(--ok); }
+    .pill.failed, .pill.rejected { background: #f8e8e4; color: var(--bad); }
+    .pill.processing, .pill.pending, .pill.queued { background: #f8efd8; color: var(--warn); }
+    .error { color: var(--bad); margin: 8px 0 0; }
+    .empty { color: var(--muted); margin: 0; }
+    .bar { height: 8px; background: #efe8dc; border-radius: 99px; overflow: hidden; margin: 10px 0; }
+    .bar > span { display: block; height: 100%; background: var(--accent); width: 0; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Contract batch review</h1>
+    <p class="lede">Upload a ZIP and the variables to extract. Findings appear here for accept or reject.</p>
+  </header>
+  <main>
+    <section>
+      <h2>New batch</h2>
+      <form id="upload-form">
+        <div class="row two">
+          <div>
+            <label for="file">ZIP file</label>
+            <input id="file" name="file" type="file" accept=".zip,application/zip" required />
+          </div>
+          <div>
+            <label for="variables">Variables</label>
+            <input id="variables" name="variables" type="text" required
+              placeholder="effective_date, governing_law" />
+          </div>
+        </div>
+        <div class="actions">
+          <button type="submit" id="submit">Upload</button>
+        </div>
+        <p id="upload-error" class="error" hidden></p>
+      </form>
+    </section>
+
+    <section>
+      <h2>Open an existing batch</h2>
+      <form id="open-form" class="row two">
+        <div>
+          <label for="batch-id">Batch id</label>
+          <input id="batch-id" type="text" placeholder="Paste a batch id" />
+        </div>
+        <div class="actions" style="align-items: end;">
+          <button type="submit" class="ghost">Load</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="status-panel" hidden>
+      <h2>Batch</h2>
+      <p id="batch-meta" class="stats"></p>
+      <div class="bar" aria-hidden="true"><span id="progress-bar"></span></div>
+      <p id="batch-message" class="empty"></p>
+    </section>
+
+    <section id="docs-panel" hidden>
+      <h2>Documents</h2>
+      <div id="docs"></div>
+    </section>
+
+    <section id="findings-panel" hidden>
+      <h2>Findings</h2>
+      <div class="actions" id="filters">
+        <button type="button" class="ghost" data-filter="">All</button>
+        <button type="button" class="ghost" data-filter="pending">Pending</button>
+        <button type="button" class="ghost" data-filter="accepted">Accepted</button>
+        <button type="button" class="ghost" data-filter="rejected">Rejected</button>
+      </div>
+      <div id="findings"></div>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let batchId = localStorage.getItem("batchId") || "";
+    let filter = "pending";
+    let pollTimer = null;
+
+    function showError(el, message) {
+      el.hidden = !message;
+      el.textContent = message || "";
+    }
+
+    function pill(status) {
+      return `<span class="pill ${status}">${status}</span>`;
+    }
+
+    async function readError(response) {
+      try {
+        const body = await response.json();
+        return body.detail || response.statusText;
+      } catch {
+        return response.statusText;
+      }
+    }
+
+    $("upload-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = $("submit");
+      button.disabled = true;
+      showError($("upload-error"), "");
+      const data = new FormData();
+      data.append("file", $("file").files[0]);
+      data.append("variables", $("variables").value.trim());
+      try {
+        const response = await fetch("/api/v1/batches/", { method: "POST", body: data });
+        if (!response.ok) throw new Error(await readError(response));
+        const body = await response.json();
+        await track(body.id);
+      } catch (error) {
+        showError($("upload-error"), error.message);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $("open-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const id = $("batch-id").value.trim();
+      if (id) await track(id);
+    });
+
+    $("filters").addEventListener("click", (event) => {
+      const button = event.target.closest("button");
+      if (!button) return;
+      filter = button.dataset.filter;
+      if (batchId) loadFindings();
+    });
+
+    async function track(id) {
+      batchId = id;
+      localStorage.setItem("batchId", id);
+      $("batch-id").value = id;
+      $("status-panel").hidden = false;
+      await refresh();
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(refresh, 1500);
+    }
+
+    async function refresh() {
+      if (!batchId) return;
+      const response = await fetch(`/api/v1/batches/${batchId}`);
+      if (!response.ok) {
+        $("batch-message").textContent = await readError(response);
+        return;
+      }
+      const batch = await response.json();
+      const done = batch.progress.completed + batch.progress.failed;
+      const pct = batch.progress.total ? Math.round((done / batch.progress.total) * 100) : 0;
+      $("progress-bar").style.width = `${pct}%`;
+      $("batch-meta").innerHTML = `
+        <span>Id <strong><code>${batch.id}</code></strong></span>
+        <span>Status ${pill(batch.status)}</span>
+        <span>Documents <strong>${done}/${batch.progress.total}</strong></span>
+        <span>Failed <strong>${batch.progress.failed}</strong></span>
+        <span>Pending review <strong>${batch.review.pending}</strong></span>
+      `;
+      $("batch-message").textContent = batch.ready_for_review
+        ? "Findings are ready to review."
+        : "Processing documents…";
+      await loadDocuments();
+      if (batch.ready_for_review || batch.status === "completed" || batch.status === "failed") {
+        $("findings-panel").hidden = false;
+        await loadFindings();
+      }
+      if (batch.progress.pending === 0 && (batch.status === "completed" || batch.status === "failed")) {
+        clearInterval(pollTimer);
+      }
+    }
+
+    async function loadDocuments() {
+      const response = await fetch(`/api/v1/batches/${batchId}/documents?limit=200`);
+      if (!response.ok) return;
+      const body = await response.json();
+      $("docs-panel").hidden = false;
+      if (!body.items.length) {
+        $("docs").innerHTML = `<p class="empty">No documents yet.</p>`;
+        return;
+      }
+      $("docs").innerHTML = `<table>
+        <thead><tr><th>File</th><th>Status</th><th>Findings</th><th>Error</th></tr></thead>
+        <tbody>
+          ${body.items.map((doc) => `<tr>
+            <td>${escapeHtml(doc.filename)}</td>
+            <td>${pill(doc.status)}</td>
+            <td>${doc.finding_count}</td>
+            <td>${escapeHtml(doc.error || "")}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>`;
+    }
+
+    async function loadFindings() {
+      const query = filter ? `?review_status=${encodeURIComponent(filter)}&limit=200` : "?limit=200";
+      const response = await fetch(`/api/v1/batches/${batchId}/findings${query}`);
+      if (!response.ok) return;
+      const body = await response.json();
+      if (!body.items.length) {
+        $("findings").innerHTML = `<p class="empty">No findings in this view.</p>`;
+        return;
+      }
+      $("findings").innerHTML = `<table>
+        <thead><tr><th>Document</th><th>Variable</th><th>Value</th><th>Review</th><th></th></tr></thead>
+        <tbody>
+          ${body.items.map((item) => `<tr>
+            <td>${escapeHtml(item.document_filename)}</td>
+            <td><code>${escapeHtml(item.variable_name)}</code></td>
+            <td>${escapeHtml(item.value)}</td>
+            <td>${pill(item.review_status)}</td>
+            <td class="actions" style="margin:0">
+              <button type="button" data-id="${item.id}" data-decision="accepted">Accept</button>
+              <button type="button" class="ghost" data-id="${item.id}" data-decision="rejected">Reject</button>
+            </td>
+          </tr>`).join("")}
+        </tbody>
+      </table>`;
+    }
+
+    $("findings").addEventListener("click", async (event) => {
+      const button = event.target.closest("button[data-decision]");
+      if (!button) return;
+      button.disabled = true;
+      const response = await fetch(`/api/v1/findings/${button.dataset.id}/review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: button.dataset.decision }),
+      });
+      if (!response.ok) {
+        $("batch-message").textContent = await readError(response);
+        button.disabled = false;
+        return;
+      }
+      await refresh();
+    });
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    if (batchId) track(batchId);
+  </script>
+</body>
+</html>
