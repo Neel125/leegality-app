@@ -4,6 +4,21 @@ This document describes how the current assignment system would evolve. **None o
 
 Target: tens of thousands of documents per hour, multiple API instances, durable processing, real extractors, and human review at team scale.
 
+
+## Current limits that force the change
+
+| Area | v1 | Why it breaks in production |
+|---|---|---|
+| Compute | One Uvicorn process, in-process poller | Cannot scale ingest and extract independently; restart drops in-flight work |
+| Queue | `SELECT` + `UPDATE ... WHERE status=queued` on SQLite | Writer lock, no visibility timeout, stale `processing` rows |
+| Storage | Local disk `storage/{batch_id}/` | Not shared across hosts; no lifecycle or encryption |
+| Database | SQLite | No concurrent writers, no replicas, no point-in-time recovery |
+| Ingest | Whole ZIP in memory | 1,000 × 15 MB ≈ 15 GB RAM per request |
+| Extractor | Mock, no retries | Real OCR/LLM is slow, rate-limited, and flaky |
+| Review | Poll + no auth | No roles, no audit, no push when a batch is ready |
+| Ops | No metrics/tracing | Cannot SLO extract latency or find poison documents |
+
+
 ## Coverage checklist
 
 | Requirement | Where it is specified |
@@ -20,38 +35,59 @@ Keep the **domain model** (`Batch` → `Document` → `Finding`) and the **HTTP 
 
 ## Target architecture
 
-This is the production shape. The API accepts the upload and returns. A separate ingestion worker unpacks the ZIP. Extraction workers pull from a queue and call one adapter. Review reads findings from Postgres.
+This is the production shape. The API accepts the upload and returns. File bytes live in object storage. Postgres is the source of truth for batches, documents, and findings. Redis caches the two reads that would otherwise hammer Postgres and the OCR/LLM providers. A separate ingestion worker unpacks the ZIP. Extraction workers pull from a queue and call one adapter.
 
 ```mermaid
 flowchart TD
   Client[Client] --> API[API Service]
-  API --> OBJ["Object Store\nZIP / Documents"]
-  API --> PG["PostgreSQL\nMetadata"]
+  Review[Review UI] --> API
+  API --> OBJ["Object store\nZIP and document bytes"]
+  API --> PG["PostgreSQL\nsource of truth"]
+  API --> Redis["Redis cache\nbatch progress and extract hits"]
   OBJ --> Ingest[ZIP / Ingestion Worker]
+  Ingest --> OBJ
   Ingest --> Q[Queue]
   Q --> W1[Worker 1]
   Q --> W2[Worker 2]
   Q --> WN[Worker N]
-  W1 --> Adapter["Extraction Adapter\nMock API / OCR Provider / LLM Provider"]
+  W1 --> Adapter["Extraction Adapter\nMock API / OCR / LLM"]
   W2 --> Adapter
   WN --> Adapter
-  Adapter --> Findings["Findings\nPending / Accepted / Rejected"]
-  PG -.-> Findings
-  Findings --> Review[Review UI]
+  Adapter --> OBJ
+  Adapter --> Redis
+  W1 --> PG
+  W2 --> PG
+  WN --> PG
+  PG --> Findings["Findings\nPending / Accepted / Rejected"]
+  Findings --> Review
 ```
 
 | Component | Responsibility |
 |---|---|
-| **Client** | Uploads the ZIP and variable list. Later, the review UI is a client of the same API. |
-| **API Service** | Stateless FastAPI replicas. Validates the request, stores the ZIP in the object store, writes the `Batch` row in Postgres, returns **202**. Does not unzip and does not call OCR or an LLM. |
-| **Object store** | Durable bytes: original ZIP, then one object per document (`s3://…/{batch_id}/{filename}`). Shared by the API, the ingestion worker, and extraction workers. |
-| **PostgreSQL** | Metadata only: batches, documents, findings, review status. Findings the review UI shows live here. |
-| **ZIP / ingestion worker** | Reads the ZIP from the object store, streams **one file at a time** (≤ 15 MB), writes the document object, inserts a `Document` row, enqueues `document_id`. Drops the file buffer before the next entry. |
-| **Queue** | One message per document. Decouples unpacking from extraction so worker count follows queue depth. |
-| **Worker 1…N** | Each claims one message, loads that document from the object store, calls the extraction adapter, writes findings as `pending`. Scale N by vendor QPS, not by file count. |
-| **Extraction adapter** | The `ExtractionClient` seam. Implementations: **Mock API** (today), **OCR provider** (scanned pages), **LLM provider** (structured variables on text). Workers depend on the adapter, not on a vendor SDK. |
-| **Findings** | One row per variable: `pending`, then `accepted` or `rejected`. Written by workers; updated by the review API. |
-| **Review UI** | Lists pending findings and posts accept / reject / edit. Reads Postgres through the API. |
+| **Client** | Uploads the ZIP and variable list. |
+| **API Service** | Stateless FastAPI replicas. Stores the ZIP in the object store, writes the `Batch` row in Postgres, returns **202**. Does not unzip and does not call OCR or an LLM. Serves batch progress from Redis when the key is warm. |
+| **Object store** | Durable bytes only: the original ZIP, then one object per document (`s3://…/{batch_id}/{filename}`). The API writes the ZIP. The ingestion worker reads the ZIP and writes each document. Extraction workers read one document object per job. File bytes are not stored in Postgres, Redis, or the queue. |
+| **PostgreSQL** | Source of truth for batches, documents, findings, and review status. A Redis miss or eviction always falls back here. |
+| **Redis cache** | Short-lived copies of hot reads. Not a second database. See below. |
+| **ZIP / ingestion worker** | Reads the ZIP from the object store, streams **one file at a time** (≤ 15 MB), writes that document object, inserts a `Document` row, enqueues `document_id` plus the object key. Drops the file buffer before the next entry. |
+| **Queue** | One message per document: `document_id`, `batch_id`, `storage_key`. Decouples unpacking from extraction. This is a durable queue (SQS, RabbitMQ, or Redis streams), separate from the cache keys. |
+| **Worker 1…N** | Each claims one message, loads that document from the object store, calls the extraction adapter, writes findings as `pending` in Postgres, then refreshes the Redis progress key. Scale N by vendor QPS, not by file count. |
+| **Extraction adapter** | The `ExtractionClient` seam. Implementations: **Mock API**, **OCR provider**, **LLM provider**. On a cache hit it returns the stored extraction and skips the vendor. |
+| **Findings** | One row per variable in Postgres: `pending`, then `accepted` or `rejected`. |
+| **Review UI** | Polls the API, which reads progress from Redis and findings from Postgres. Accept and reject write Postgres and invalidate the cached review counts. |
+
+**Object store.** Every byte of a contract goes here and nowhere else. The queue message and the Redis value hold the object key (`s3://bucket/{batch_id}/lease.pdf`), not the PDF.
+
+**Redis, and only for these keys.**
+
+| Key | Written by | Read by | Why |
+|---|---|---|---|
+| `batch:{id}:progress` | Ingestion worker and extraction workers after each document status change | API on `GET /batches/{id}` | The review page polls every few seconds. Counting 1,000 document rows on each poll is the hot path. TTL is short; Postgres remains correct if the key is missing. |
+| `batch:{id}:review` | Review API on accept/reject, workers when findings are inserted | Same poll | Pending / accepted / rejected counts for `ready_for_review`. |
+| `extract:{content_hash}:{schema_version}` | Extraction worker after a successful vendor call | Extraction adapter before calling OCR or the LLM | The same file uploaded again, or a retry, does not pay for another extract. |
+| `ratelimit:{provider}` | Extraction workers | Extraction workers | Caps in-flight OCR/LLM calls so N workers stay inside the vendor quota. |
+
+Redis is not used for the ZIP, document bodies, finding text, or the accept/reject decision. Those stay in the object store and Postgres. If Redis is down, uploads, the queue, and review still work; polls get slower because they count rows in Postgres, and extracts skip the hash cache.
 
 Request path:
 
@@ -65,18 +101,55 @@ Memory stays flat because no stage holds `N × 15 MB`. The API stores the ZIP an
 
 `DocumentProcessingService` stays behind the workers. The in-process `DocumentProcessingWorker` poller is removed from the API process.
 
-## Current limits that force the change
+## How each file moves onto the queue
 
-| Area | v1 | Why it breaks in production |
-|---|---|---|
-| Compute | One Uvicorn process, in-process poller | Cannot scale ingest and extract independently; restart drops in-flight work |
-| Queue | `SELECT` + `UPDATE ... WHERE status=queued` on SQLite | Writer lock, no visibility timeout, stale `processing` rows |
-| Storage | Local disk `storage/{batch_id}/` | Not shared across hosts; no lifecycle or encryption |
-| Database | SQLite | No concurrent writers, no replicas, no point-in-time recovery |
-| Ingest | Whole ZIP in memory | 1,000 × 15 MB ≈ 15 GB RAM per request |
-| Extractor | Mock, no retries | Real OCR/LLM is slow, rate-limited, and flaky |
-| Review | Poll + no auth | No roles, no audit, no push when a batch is ready |
-| Ops | No metrics/tracing | Cannot SLO extract latency or find poison documents |
+The ZIP bytes stay in the object store. The queue message is a pointer. A 15 MB contract is never copied into the message body, and the ingestion worker does not hand the next file to an extraction worker in memory.
+
+For one entry inside the ZIP, in this order:
+
+1. **Read one entry.** The ingestion worker opens the ZIP from the object store and streams a single member, stopping at 15 MB. Junk paths are skipped. The other 999 files stay in the archive.
+2. **Write the file.** Those bytes are stored as their own object, for example `s3://bucket/{batch_id}/lease.pdf`. The buffer for this entry can be dropped after the put succeeds.
+3. **Write the row.** Postgres gets one `Document` with `status=queued`, the object key in `storage_path`, and the filename and size. The row is committed before any message is sent, so a worker never receives an id that does not exist.
+4. **Publish one message.** The body is only:
+
+```json
+{
+  "document_id": "…",
+  "batch_id": "…",
+  "storage_key": "s3://bucket/{batch_id}/lease.pdf"
+}
+```
+
+5. **Repeat.** The ingestion worker starts the next ZIP entry. Peak memory on that process is one file, not `N × 15 MB`.
+
+```mermaid
+sequenceDiagram
+  participant Ingest as IngestionWorker
+  participant Store as ObjectStore
+  participant DB as PostgreSQL
+  participant Q as Queue
+  participant Worker as ExtractionWorker
+
+  Ingest->>Store: GET zip
+  loop each file
+    Ingest->>Store: PUT one document object
+    Ingest->>DB: INSERT Document queued
+    Ingest->>Q: publish document_id and storage_key
+  end
+  Q->>Worker: deliver one message
+  Worker->>DB: claim status processing
+  Worker->>Store: GET that object only
+  Worker->>DB: INSERT findings pending
+```
+
+What the extraction worker does with that message:
+
+- It claims the row (`queued` → `processing`) using `document_id`. A second copy of the same message does not start a second extract.
+- It downloads **that** object with `storage_key`, calls the extraction adapter, and writes findings.
+- It deletes the message only after the findings commit. If the process dies first, the queue shows the message again after the visibility timeout, and the claim is idempotent.
+
+If the process dies after the object and the row exist but before publish, a sweeper republishes every `Document` still `queued` with no in-flight message. The file does not need to be read from the ZIP again; the object key is already on the row.
+
 
 ## Phased evolution
 
